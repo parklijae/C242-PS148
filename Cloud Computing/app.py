@@ -35,8 +35,6 @@ jwt = JWTManager(app)
 storage_client = storage.Client()
 BUCKET_NAME = os.getenv("BUCKET_NAME")
 
-storage_client = storage.Client()
-BUCKET_NAME = os.getenv("BUCKET_NAME")
 
 # Mengambil bucket
 bucket = storage_client.get_bucket(BUCKET_NAME)
@@ -257,7 +255,7 @@ def update_profile():
             blob.make_public()
             
             # URL publik untuk gambar
-            public_image_url = f"https://storage.googleapis.com/{bucket_name}/profile_images/{unique_filename}"
+            public_image_url = f"https://storage.googleapis.com/{BUCKET_NAME}/profile_images/{unique_filename}"
             data['profile_image'] = public_image_url
     
     # Koneksi ke database
@@ -1023,7 +1021,7 @@ def predict_all():
         blob.make_public()
 
         # Buat URL publik untuk gambar di Cloud Storage
-        public_image_url = f"https://storage.googleapis.com/{bucket_name}/attendance_images/{unique_filename}"
+        public_image_url = f"https://storage.googleapis.com/{BUCKET_NAME}/attendance_images/{unique_filename}"
 
         img_absen = image.load_img(local_file_path, target_size=(224, 224))  # Gunakan gambar lokal untuk prediksi
         img_array_absen = image.img_to_array(img_absen)

@@ -35,13 +35,11 @@ jwt = JWTManager(app)
 storage_client = storage.Client()
 BUCKET_NAME = os.getenv("BUCKET_NAME")
 
-client = storage.Client()
-
-# Nama bucket Anda
-bucket_name = 'storage-images-checkmate'
+storage_client = storage.Client()
+BUCKET_NAME = os.getenv("BUCKET_NAME")
 
 # Mengambil bucket
-bucket = client.get_bucket(bucket_name)
+bucket = storage_client.get_bucket(BUCKET_NAME)
 
 # Load models
 model_absen_path = os.getenv('MODEL_ABSEN_PATH')

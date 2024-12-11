@@ -14,6 +14,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing import image
 from PIL import Image
+from werkzeug.utils import secure_filename
 import numpy as np
 import requests
 from datetime import datetime, timedelta
@@ -24,7 +25,7 @@ load_dotenv()
 
 # Flask setup
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'mE1rYpH35gXfzsxuiJc1'
+app.config['SECRET_KEY'] = os.getenv('FLASK_SECRET_KEY')
 
 app.config['JWT_SECRET_KEY'] = 'your_jwt_secret_key'  # Ganti dengan secret key yang aman
 jwt = JWTManager(app)
@@ -34,6 +35,14 @@ jwt = JWTManager(app)
 storage_client = storage.Client()
 BUCKET_NAME = os.getenv("BUCKET_NAME")
 
+client = storage.Client()
+
+# Nama bucket Anda
+bucket_name = 'storage-images-checkmate'
+
+# Mengambil bucket
+bucket = client.get_bucket(bucket_name)
+
 # Load models
 model_absen_path = os.getenv('MODEL_ABSEN_PATH')
 model_dasi_path = os.getenv('MODEL_DASI_PATH')
@@ -42,8 +51,8 @@ model_mood_path = os.getenv('MODEL_MOOD_PATH')
 class_labels = ['liza', 'nabila', 'noface', 'zain']
 class_names = ['angry', 'happy', 'neutral', 'sad']
 
-IMAGE_UPLOAD_DIR = 'storage/attendance_images'
-IMAGE_PUBLIC_URL_BASE = 'https://checkmate-506488875993.asia-southeast2.run.app/storage/attendance_images/'  # Base URL untuk akses frontend
+IMAGE_UPLOAD_DIR = os.getenv('IMAGE_UPLOAD_DIR')
+IMAGE_PUBLIC_URL_BASE = os.getenv('IMAGE_PUBLIC_URL_BASE')
 
 
 # Pastikan direktori sudah ada
@@ -80,16 +89,54 @@ model_dasi = load_model_from_url(model_dasi_path, "temp_dasidasi.keras")
 model_mood = load_model_from_url(model_mood_path, "temp_ekspresi.h5")
 
 
-# Register user
+# Fungsi untuk menghasilkan nama file unik
+def generate_unique_filename(filename):
+    unique_name = str(uuid.uuid4()) + os.path.splitext(filename)[1]  # Menambahkan ekstensi file asli
+    return unique_name
+
+# Register user with profile image
 @app.route('/api/register', methods=['POST'])
 def register():
-    data = request.get_json()
+    data = request.form  # Gunakan request.form untuk data non-file, request.files untuk file
     username, email, student_number, password, role = (
         data['username'], data['email'], data['student_number'], 
         data['password'], data['role']
     )
     hashed_password = generate_password_hash(password)
     
+    # Cek apakah ada file gambar yang diunggah
+    if 'profile_image' not in request.files:
+        return jsonify({"status": "error", "message": "File not found"}), 400
+
+    file = request.files['profile_image']
+
+    # Pastikan ekstensi file valid
+    allowed_extensions = {'png', 'jpg', 'jpeg'}
+    filename = secure_filename(file.filename)
+    file_ext = filename.rsplit('.', 1)[-1].lower()
+
+    if file_ext not in allowed_extensions:
+        return jsonify({"status": "error", "message": "Invalid image format. Only png, jpg, and jpeg are allowed."}), 400
+
+    # Generate unique filename
+    unique_filename = generate_unique_filename(filename)
+
+    # Upload file ke Google Cloud Storage
+    try:
+        file.seek(0)  # Reset pointer file ke awal
+        blob = bucket.blob(f'profile_images/{unique_filename}')
+        blob.upload_from_file(file)
+
+        # Pastikan file dapat diakses publik
+        blob.make_public()
+
+        # URL gambar yang bisa diakses publik
+        profile_image_url = f"https://storage.googleapis.com/{BUCKET_NAME}/profile_images/{unique_filename}"
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+    
+    # Koneksi ke database
     connection = connect_db()
     try:
         with connection.cursor(pymysql.cursors.DictCursor) as cursor:
@@ -100,8 +147,8 @@ def register():
 
             # Insert user
             cursor.execute(
-                "INSERT INTO users (username, email, student_number, password, role) VALUES (%s, %s, %s, %s, %s)",
-                (username, email, student_number, hashed_password, role)
+                "INSERT INTO users (username, email, student_number, password, role, profile_image) VALUES (%s, %s, %s, %s, %s, %s)",
+                (username, email, student_number, hashed_password, role, profile_image_url)
             )
             user_id = cursor.lastrowid
             
@@ -112,7 +159,7 @@ def register():
                 cursor.execute("INSERT INTO guru (user_id) VALUES (%s)", (user_id,))
             elif role == 'orang_tua':
                 cursor.execute("INSERT INTO orang_tua (user_id, student_id) VALUES (%s, NULL)", (user_id,))
-                
+
         connection.commit()
         return jsonify({"status": "success", "message": "User registered successfully"}), 201
     except Exception as e:
@@ -120,6 +167,7 @@ def register():
         return jsonify({"status": "error", "message": str(e)}), 500
     finally:
         connection.close()
+
 
 @app.route('/api/login', methods=['POST'])
 def login():
@@ -182,59 +230,77 @@ def get_current_user():
     finally:
         connection.close()
 
-# Update profile
 @app.route('/api/update_profile', methods=['PUT'])
 @jwt_required()
 def update_profile():
     # Get current user details
     current_user = get_current_user()
-    role = current_user['role']
     
-    # Data yang dikirimkan oleh client
-    data = request.get_json()
+    if not current_user:
+        return jsonify({"status": "error", "message": "User not authenticated"}), 401
+
+    # Ambil data dari JSON
+    data = request.form.to_dict()  # Mengambil form-data
     
-    # Validasi data berdasarkan role
-    required_fields = {
-        'siswa': ['class', 'grade'],
-        'guru': ['subject', 'qualification'],
-        'orang_tua': ['phone_number', 'address', 'student_id']
-    }
-    
-    if role not in required_fields:
-        return jsonify({"status": "error", "message": "Invalid role"}), 400
-    
-    missing_fields = [field for field in required_fields[role] if field not in data]
-    if missing_fields:
-        return jsonify({
-            "status": "error",
-            "message": f"Missing required fields: {', '.join(missing_fields)}"
-        }), 422
+    # Menangani update gambar profile jika ada
+    if 'profile_image' in request.files:
+        file = request.files['profile_image']
+        
+        if file:
+            # Generate unique filename
+            unique_filename = generate_unique_filename(file.filename)
+            
+            # --- Upload file ke Google Cloud Storage ---
+            file.seek(0)  # Reset pointer file ke awal
+            blob = bucket.blob(f'profile_images/{unique_filename}')
+            blob.upload_from_file(file)
+            
+            # Pastikan file dapat diakses publik
+            blob.make_public()
+            
+            # URL publik untuk gambar
+            public_image_url = f"https://storage.googleapis.com/{bucket_name}/profile_images/{unique_filename}"
+            data['profile_image'] = public_image_url
     
     # Koneksi ke database
     connection = connect_db()
     try:
-        with connection.cursor() as cursor:
-            if role == 'siswa':
+        with connection.cursor(pymysql.cursors.DictCursor) as cursor:
+            # Update data pengguna utama
+            update_query = """
+                UPDATE users SET 
+                    username = IFNULL(%s, username), 
+                    email = IFNULL(%s, email), 
+                    student_number = IFNULL(%s, student_number), 
+                    profile_image = IFNULL(%s, profile_image) 
+                WHERE id = %s
+            """
+            cursor.execute(update_query, (
+                data.get('username'),
+                data.get('email'),
+                data.get('student_number'),
+                data.get('profile_image'),
+                current_user['id']
+            ))
+
+            # Update data siswa jika ada
+            if 'class' in data or 'grade' in data:
                 cursor.execute("""
-                    UPDATE siswa SET class=%s, grade=%s WHERE user_id=%s
+                    UPDATE siswa SET 
+                        class = IFNULL(%s, class),
+                        grade = IFNULL(%s, grade)
+                    WHERE user_id = %s
                 """, (data.get('class'), data.get('grade'), current_user['id']))
-            elif role == 'guru':
-                cursor.execute("""
-                    UPDATE guru SET subject=%s, qualification=%s WHERE user_id=%s
-                """, (data.get('subject'), data.get('qualification'), current_user['id']))
-            elif role == 'orang_tua':
-                cursor.execute("""
-                    UPDATE orang_tua SET phone_number=%s, address=%s, student_id=%s WHERE user_id=%s
-                """, (data.get('phone_number'), data.get('address'), data.get('student_id'), current_user['id']))
-        
-        # Simpan perubahan ke database
-        connection.commit()
+            
+            connection.commit()
         return jsonify({"status": "success", "message": "Profile updated successfully"}), 200
     except Exception as e:
         connection.rollback()
         return jsonify({"status": "error", "message": str(e)}), 500
     finally:
         connection.close()
+
+
 
 
 @app.route('/api/get_profile', methods=['GET'])
@@ -245,14 +311,17 @@ def get_profile():
     
     if not current_user:
         return jsonify({"status": "error", "message": "User not authenticated"}), 401
-    
+
     user_id = current_user['id']
     role = current_user['role']
 
     connection = connect_db()
     try:
         with connection.cursor(pymysql.cursors.DictCursor) as cursor:
-            # Ambil data spesifik berdasarkan role
+            # Ambil data umum dari tabel users
+            cursor.execute("SELECT username, email, student_number, profile_image, role FROM users WHERE id=%s", (user_id,))
+            user_data = cursor.fetchone()
+
             if role == 'siswa':
                 cursor.execute("SELECT class, grade FROM siswa WHERE user_id=%s", (user_id,))
                 specific_data = cursor.fetchone()
@@ -263,12 +332,15 @@ def get_profile():
                 return jsonify({"status": "error", "message": "Invalid role"}), 400
 
             # Gabungkan data umum dan spesifik
-            profile_data = {**current_user, **(specific_data or {})}
+            profile_data = {**user_data, **(specific_data or {})}
             return jsonify({"status": "success", "data": profile_data}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
     finally:
         connection.close()
+
+
+
 
 @app.route('/api/student-recap', methods=['GET'])
 @jwt_required()
@@ -291,7 +363,7 @@ def get_student_recap_status():
                     return jsonify({"status": "error", "message": "Invalid date format. Use YYYY-MM-DD"}), 400
 
                 query = """
-                    SELECT a.student_id, u.username, a.status_absen, a.status_mood, a.status_dasi, a.image_url, a.date
+                    SELECT a.student_id, u.username, a.status_absen, a.status_mood, a.status_dasi, a.semester_total_point, a.point, a.image_url, a.date
                     FROM attendance a
                     JOIN siswa s ON a.student_id = s.id
                     JOIN users u ON s.user_id = u.id
@@ -301,7 +373,7 @@ def get_student_recap_status():
                 cursor.execute(query, (student_name, target_date))
             else:
                 query = """
-                    SELECT a.student_id, u.username, a.status_absen, a.status_mood, a.status_dasi, a.image_url, a.date
+                    SELECT a.student_id, u.username, a.status_absen, a.status_mood, a.status_dasi, a.semester_total_point, a.point, a.image_url, a.date
                     FROM attendance a
                     JOIN siswa s ON a.student_id = s.id
                     JOIN users u ON s.user_id = u.id
@@ -321,7 +393,9 @@ def get_student_recap_status():
                         "mood_status": record['status_mood'] or "Unknown",
                         "tie_status": record['status_dasi'] or "Unknown",
                         "image_url": record['image_url'] or "No Image Available",
-                        "date": record['date'].strftime('%Y-%m-%d %H:%M:%S')
+                        "date": record['date'].strftime('%Y-%m-%d %H:%M:%S'),
+                        "point": record['point'],
+                        "semester_total_point": record['semester_total_point']
                     }
                 }), 200
             else:
@@ -358,7 +432,7 @@ def get_student_attendance_status():
 
                 # Query berdasarkan nama siswa dan tanggal
                 cursor.execute("""
-                    SELECT a.student_id, u.username, a.status_absen, a.image_url, a.date
+                    SELECT a.student_id, u.username, a.status_absen, a.semester_total_point, a.point, a.image_url, a.date
                     FROM attendance a
                     JOIN siswa s ON a.student_id = s.id
                     JOIN users u ON s.user_id = u.id
@@ -368,7 +442,7 @@ def get_student_attendance_status():
             else:
                 # Query jika tidak ada tanggal, ambil data terbaru
                 cursor.execute("""
-                    SELECT a.student_id, u.username, a.status_absen, a.image_url, a.date
+                    SELECT a.student_id, u.username, a.status_absen, a.semester_total_point, a.point, a.image_url, a.date
                     FROM attendance a
                     JOIN siswa s ON a.student_id = s.id
                     JOIN users u ON s.user_id = u.id
@@ -386,7 +460,9 @@ def get_student_attendance_status():
                         "username": record['username'],
                         "status_absen": record['status_absen'],
                         "image_url": record['image_url'] if record['image_url'] else "No Image Available",
-                        "date": record['date'].strftime('%Y-%m-%d %H:%M:%S')
+                        "date": record['date'].strftime('%Y-%m-%d %H:%M:%S'),
+                        "point": record['point'],
+                        "semester_total_point": record['semester_total_point']
                     }
                 }), 200
             else:
@@ -426,7 +502,7 @@ def get_student_mood_status():
 
                 # Query berdasarkan nama siswa dan tanggal
                 cursor.execute("""
-                    SELECT a.student_id, u.username, a.status_mood, a.image_url, a.date
+                    SELECT a.student_id, u.username, a.status_mood, a.semester_total_point, a.point, a.image_url, a.date
                     FROM attendance a
                     JOIN siswa s ON a.student_id = s.id
                     JOIN users u ON s.user_id = u.id
@@ -436,7 +512,7 @@ def get_student_mood_status():
             else:
                 # Query jika tidak ada tanggal, ambil data terbaru
                 cursor.execute("""
-                    SELECT a.student_id, u.username, a.status_mood, a.image_url, a.date
+                    SELECT a.student_id, u.username, a.status_mood, a.semester_total_point, a.point, a.image_url, a.date
                     FROM attendance a
                     JOIN siswa s ON a.student_id = s.id
                     JOIN users u ON s.user_id = u.id
@@ -454,7 +530,9 @@ def get_student_mood_status():
                         "username": record['username'],
                         "status_mood": record['status_mood'] if record['status_mood'] else "Unknown",
                         "image_url": record['image_url'] if record['image_url'] else "No Image Available",
-                        "date": record['date'].strftime('%Y-%m-%d %H:%M:%S')
+                        "date": record['date'].strftime('%Y-%m-%d %H:%M:%S'),
+                        "point": record['point'],
+                        "semester_total_point": record['semester_total_point']
                     }
                 }), 200
             else:
@@ -494,7 +572,7 @@ def get_student_tie_status():
 
                 # Query berdasarkan nama siswa dan tanggal
                 cursor.execute("""
-                    SELECT a.student_id, u.username, a.status_dasi, a.image_url, a.date
+                    SELECT a.student_id, u.username, a.status_dasi, a.semester_total_point, a.point, a.image_url, a.date
                     FROM attendance a
                     JOIN siswa s ON a.student_id = s.id
                     JOIN users u ON s.user_id = u.id
@@ -504,7 +582,7 @@ def get_student_tie_status():
             else:
                 # Query jika tidak ada tanggal, ambil data terbaru
                 cursor.execute("""
-                    SELECT a.student_id, u.username, a.status_dasi, a.image_url, a.date
+                    SELECT a.student_id, u.username, a.status_dasi, a.semester_total_point, a.point, a.image_url, a.date
                     FROM attendance a
                     JOIN siswa s ON a.student_id = s.id
                     JOIN users u ON s.user_id = u.id
@@ -522,7 +600,9 @@ def get_student_tie_status():
                         "username": record['username'],
                         "status_dasi": record['status_dasi'] if record['status_dasi'] else "Unknown",
                         "image_url": record['image_url'] if record['image_url'] else "No Image Available",
-                        "date": record['date'].strftime('%Y-%m-%d %H:%M:%S')
+                        "date": record['date'].strftime('%Y-%m-%d %H:%M:%S'),
+                        "point": record['point'],
+                        "semester_total_point": record['semester_total_point']
                     }
                 }), 200
             else:
@@ -564,7 +644,7 @@ def get_attendance_by_date_or_all():
 
                 # Query berdasarkan tanggal tertentu
                 cursor.execute("""
-                    SELECT a.student_id, u.username, a.status_absen, a.status_mood, a.status_dasi, a.image_url, a.date
+                    SELECT a.student_id, u.username, a.status_absen, a.status_mood, a.status_dasi, a.semester_total_point, a.point, a.image_url, a.date
                     FROM attendance a
                     JOIN siswa s ON a.student_id = s.id
                     JOIN users u ON s.user_id = u.id
@@ -574,7 +654,7 @@ def get_attendance_by_date_or_all():
             else:
                 # Query untuk seluruh data
                 cursor.execute("""
-                    SELECT a.student_id, u.username, a.status_absen, a.status_mood, a.status_dasi, a.image_url, a.date
+                    SELECT a.student_id, u.username, a.status_absen, a.status_mood, a.status_dasi, a.semester_total_point, a.point, a.image_url, a.date
                     FROM attendance a
                     JOIN siswa s ON a.student_id = s.id
                     JOIN users u ON s.user_id = u.id
@@ -607,7 +687,9 @@ def get_attendance_by_date_or_all():
                     "status_mood": record['status_mood'] if record['status_mood'] else "Unknown",
                     "status_dasi": record['status_dasi'] if record['status_dasi'] else "Unknown",
                     "image_url": record['image_url'] if record['image_url'] else "No Image Available",
-                    "date": record['date'].strftime('%Y-%m-%d %H:%M:%S')
+                    "date": record['date'].strftime('%Y-%m-%d %H:%M:%S'),
+                    "point": record['point'],
+                    "semester_total_point": record['semester_total_point']
                 }
                 for record in attendance_data
             ]
@@ -654,7 +736,7 @@ def get_attendance_status():
 
                 # Query berdasarkan tanggal tertentu
                 cursor.execute("""
-                    SELECT a.student_id, u.username, a.status_absen, a.image_url, a.date
+                    SELECT a.student_id, u.username, a.status_absen, a.semester_total_point, a.point, a.image_url, a.date
                     FROM attendance a
                     JOIN siswa s ON a.student_id = s.id
                     JOIN users u ON s.user_id = u.id
@@ -664,7 +746,7 @@ def get_attendance_status():
             else:
                 # Query untuk seluruh data
                 cursor.execute("""
-                    SELECT a.student_id, u.username, a.status_absen, a.image_url, a.date
+                    SELECT a.student_id, u.username, a.status_absen, a.semester_total_point, a.point, a.image_url, a.date
                     FROM attendance a
                     JOIN siswa s ON a.student_id = s.id
                     JOIN users u ON s.user_id = u.id
@@ -695,7 +777,9 @@ def get_attendance_status():
                     "username": record['username'],
                     "status_absen": record['status_absen'],
                     "image_url": record['image_url'] if record['image_url'] else "No Image Available",
-                    "date": record['date'].strftime('%Y-%m-%d %H:%M:%S')
+                    "date": record['date'].strftime('%Y-%m-%d %H:%M:%S'),
+                    "point": record['point'],
+                    "semester_total_point": record['semester_total_point']
                 }
                 for record in attendance_data
             ]
@@ -742,7 +826,7 @@ def get_mood_status():
 
                 # Query berdasarkan tanggal tertentu
                 cursor.execute("""
-                    SELECT a.student_id, u.username, a.status_mood, a.image_url, a.date
+                    SELECT a.student_id, u.username, a.status_mood, a.semester_total_point, a.point, a.image_url, a.date
                     FROM attendance a
                     JOIN siswa s ON a.student_id = s.id
                     JOIN users u ON s.user_id = u.id
@@ -752,7 +836,7 @@ def get_mood_status():
             else:
                 # Query untuk seluruh data
                 cursor.execute("""
-                    SELECT a.student_id, u.username, a.status_mood, a.image_url, a.date
+                    SELECT a.student_id, u.username, a.status_mood, a.semester_total_point, a.point, a.image_url, a.date
                     FROM attendance a
                     JOIN siswa s ON a.student_id = s.id
                     JOIN users u ON s.user_id = u.id
@@ -783,7 +867,9 @@ def get_mood_status():
                     "username": record['username'],
                     "status_mood": record['status_mood'] if record['status_mood'] else "Unknown",
                     "image_url": record['image_url'] if record['image_url'] else "No Image Available",
-                    "date": record['date'].strftime('%Y-%m-%d %H:%M:%S')
+                    "date": record['date'].strftime('%Y-%m-%d %H:%M:%S'),
+                    "point": record['point'],
+                    "semester_total_point": record['semester_total_point']
                 }
                 for record in mood_data
             ]
@@ -830,7 +916,7 @@ def get_tie_status():
 
                 # Query berdasarkan tanggal tertentu
                 cursor.execute("""
-                    SELECT a.student_id, u.username, a.status_dasi, a.image_url, a.date
+                    SELECT a.student_id, u.username, a.status_dasi, a.semester_total_point, a.point, a.image_url, a.date
                     FROM attendance a
                     JOIN siswa s ON a.student_id = s.id
                     JOIN users u ON s.user_id = u.id
@@ -840,7 +926,7 @@ def get_tie_status():
             else:
                 # Query untuk seluruh data
                 cursor.execute("""
-                    SELECT a.student_id, u.username, a.status_dasi, a.image_url, a.date
+                    SELECT a.student_id, u.username, a.status_dasi, a.semester_total_point, a.point, a.image_url, a.date
                     FROM attendance a
                     JOIN siswa s ON a.student_id = s.id
                     JOIN users u ON s.user_id = u.id
@@ -871,7 +957,9 @@ def get_tie_status():
                     "username": record['username'],
                     "status_dasi": record['status_dasi'] if record['status_dasi'] else "Unknown",
                     "image_url": record['image_url'] if record['image_url'] else "No Image Available",
-                    "date": record['date'].strftime('%Y-%m-%d %H:%M:%S')
+                    "date": record['date'].strftime('%Y-%m-%d %H:%M:%S'),
+                    "point": record['point'],
+                    "semester_total_point": record['semester_total_point']
                 }
                 for record in tie_data
             ]
@@ -913,9 +1001,6 @@ def predict_all():
     
     # Generate unique filename
     unique_filename = generate_unique_filename(file.filename)
-    temp_path = os.path.join("temp", unique_filename)
-    os.makedirs("temp", exist_ok=True)
-    file.save(temp_path)
 
     connection = None  # Inisialisasi koneksi database
     try:
@@ -923,146 +1008,151 @@ def predict_all():
         results = {}
         connection = connect_db()  # Koneksi ke database
 
-        # --- Predict Absen ---
-        try:
-            # Pindahkan file ke direktori penyimpanan
-            storage_path = os.path.join(IMAGE_UPLOAD_DIR, unique_filename)
-            shutil.move(temp_path, storage_path)
+        # --- Simpan gambar di direktori lokal ---
+        local_dir = 'storage/images'
+        if not os.path.exists(local_dir):
+            os.makedirs(local_dir)
+
+        local_file_path = os.path.join(local_dir, secure_filename(unique_filename))
+        file.save(local_file_path)  # Simpan file ke direktori lokal
+
+        # --- Upload file ke Google Cloud Storage ---
+        file.seek(0)  # Reset pointer file ke awal
+        blob = bucket.blob(f'attendance_images/{unique_filename}')
+        blob.upload_from_file(file)
+
+        # Pastikan file dapat diakses publik
+        blob.make_public()
+
+        # Buat URL publik untuk gambar di Cloud Storage
+        public_image_url = f"https://storage.googleapis.com/{bucket_name}/attendance_images/{unique_filename}"
+
+        img_absen = image.load_img(local_file_path, target_size=(224, 224))  # Gunakan gambar lokal untuk prediksi
+        img_array_absen = image.img_to_array(img_absen)
+        img_array_absen = np.expand_dims(img_array_absen, axis=0) / 255.0
+
+        prediction_absen = model_absen.predict(img_array_absen)
+        predicted_index_absen = np.argmax(prediction_absen)
+        predicted_label_absen = class_labels[predicted_index_absen]
+        confidence_absen = float(prediction_absen[0][predicted_index_absen])
+
+        # Simpan hasil prediksi absen ke database
+        with connection.cursor() as cursor:
+            send_message = []
+            attendance_count = 0
+
+            # Ambil data siswa berdasarkan prediksi nama
+            cursor.execute("""
+                SELECT s.id, u.username 
+                FROM siswa s
+                JOIN users u ON s.user_id = u.id
+                WHERE LOWER(u.username) LIKE %s
+            """, (f"%{predicted_label_absen.lower()}%",))
             
-            # Buat URL publik untuk gambar
-            public_image_url = f"{IMAGE_PUBLIC_URL_BASE}{unique_filename}"
+            matching_student = cursor.fetchone()
 
-            img_absen = image.load_img(storage_path, target_size=(224, 224))
-            img_array_absen = image.img_to_array(img_absen)
-            img_array_absen = np.expand_dims(img_array_absen, axis=0) / 255.0
+            if matching_student:
+                timezone = pytz.timezone("Asia/Jakarta")
+                current_time_wib = datetime.now(timezone)
+                current_date = current_time_wib.date()
+                current_time = current_time_wib.time()
 
-            prediction_absen = model_absen.predict(img_array_absen)
-            predicted_index_absen = np.argmax(prediction_absen)
-            predicted_label_absen = class_labels[predicted_index_absen]
-            confidence_absen = float(prediction_absen[0][predicted_index_absen])
+                student_id, student_name = matching_student[0], matching_student[1]
 
-            # Simpan hasil prediksi absen ke database
-            with connection.cursor() as cursor:
-                send_message = []
-                attendance_count = 0
+                # Hitung status_absen dan poin
+                cutoff_time = datetime.strptime('08:00', '%H:%M').time()
+                status_absen = 'Hadir' if current_time <= cutoff_time else 'Terlambat'
+                point_absen = 10 if status_absen == 'Hadir' else 0
 
-                # Ambil data siswa berdasarkan prediksi nama
+                # --- Predict Dasi ---
+                img_dasi = image.load_img(local_file_path, target_size=(100, 100))  # Gunakan gambar lokal
+                img_array_dasi = image.img_to_array(img_dasi)
+                img_array_dasi = np.expand_dims(img_array_dasi, axis=0) / 255.0
+
+                prediction_dasi = model_dasi.predict(img_array_dasi)
+                predicted_class_dasi = "Tidak Ada Dasi" if prediction_dasi[0] > 0.5 else "Ada Dasi"
+                confidence_dasi = float(prediction_dasi[0]) if predicted_class_dasi == "Tidak Ada Dasi" else float(1 - prediction_dasi[0])
+
+                # Status dasi dan poin dasi
+                status_dasi = predicted_class_dasi
+                point_dasi = 10 if status_dasi == "Ada Dasi" else 0
+
+                # Total poin hari ini
+                total_point = point_absen + point_dasi
+
+                # --- Predict Mood ---
+                img_mood = Image.open(local_file_path).convert('L').resize((100, 100))  # Gunakan gambar lokal
+                img_array_mood = np.expand_dims(np.array(img_mood) / 255.0, axis=(0, -1))
+
+                prediction_mood = model_mood.predict(img_array_mood)
+                probabilities_mood = prediction_mood[0]
+                predicted_index_mood = np.argmax(probabilities_mood)
+                predicted_class_mood = class_names[predicted_index_mood]
+                confidence_mood = np.max(probabilities_mood)
+
+                status_mood = predicted_class_mood  # This line ensures that 'status_mood' is defined
+
+                # Periksa kehadiran terakhir siswa
                 cursor.execute("""
-                    SELECT s.id, u.username 
-                    FROM siswa s
-                    JOIN users u ON s.user_id = u.id
-                    WHERE LOWER(u.username) LIKE %s
-                """, (f"%{predicted_label_absen.lower()}%",))
-                
-                matching_student = cursor.fetchone()
+                    SELECT id, DATE(date) as attendance_date, semester_total_point
+                    FROM attendance
+                    WHERE student_id = %s
+                    ORDER BY date DESC
+                    LIMIT 1
+                """, (student_id,))
 
-                if matching_student:
-                    timezone = pytz.timezone("Asia/Jakarta")
-                    current_time_wib = datetime.now(timezone)
-                    current_date = current_time_wib.date()
-                    current_time = current_time_wib.time()
+                last_attendance = cursor.fetchone()
 
-                    student_id, student_name = matching_student[0], matching_student[1]
-
-                    # Hitung status_absen dan poin
-                    cutoff_time = datetime.strptime('08:00', '%H:%M').time()
-                    status_absen = 'Hadir' if current_time <= cutoff_time else 'Terlambat'
-                    point_absen = 10 if status_absen == 'Hadir' else 0
-
-                    # --- Predict Dasi ---
-                    img_dasi = image.load_img(storage_path, target_size=(100, 100))
-                    img_array_dasi = image.img_to_array(img_dasi)
-                    img_array_dasi = np.expand_dims(img_array_dasi, axis=0) / 255.0
-
-                    prediction_dasi = model_dasi.predict(img_array_dasi)
-                    predicted_class_dasi = "Tidak Ada Dasi" if prediction_dasi[0] > 0.5 else "Ada Dasi"
-                    confidence_dasi = float(prediction_dasi[0]) if predicted_class_dasi == "Tidak Ada Dasi" else float(1 - prediction_dasi[0])
-
-                    # Status dasi dan poin dasi
-                    status_dasi = predicted_class_dasi
-                    point_dasi = 10 if status_dasi == "Ada Dasi" else 0
-
-                    # Total poin hari ini
-                    total_point = point_absen + point_dasi
-
-                    # --- Predict Mood ---
-                    img_mood = Image.open(storage_path).convert('L').resize((100, 100))
-                    img_array_mood = np.expand_dims(np.array(img_mood) / 255.0, axis=(0, -1))
-
-                    prediction_mood = model_mood.predict(img_array_mood)
-                    probabilities_mood = prediction_mood[0]
-                    predicted_index_mood = np.argmax(probabilities_mood)
-                    predicted_class_mood = class_names[predicted_index_mood]
-                    confidence_mood = np.max(probabilities_mood)
-
-                    status_mood = predicted_class_mood  # This line ensures that 'status_mood' is defined
-
-                    # Periksa kehadiran terakhir siswa
+                if last_attendance and last_attendance[1] == current_date:
+                    # Update kehadiran jika di hari yang sama
                     cursor.execute("""
-                        SELECT id, DATE(date) as attendance_date, semester_total_point
-                        FROM attendance
-                        WHERE student_id = %s
-                        ORDER BY date DESC
-                        LIMIT 1
-                    """, (student_id,))
-
-                    last_attendance = cursor.fetchone()
-
-                    if last_attendance and last_attendance[1] == current_date:
-                        # Update kehadiran jika di hari yang sama
-                        cursor.execute("""
-                            UPDATE attendance
-                            SET status_absen = %s, status_mood = %s, status_dasi = %s, point = %s, 
-                                semester_total_point = semester_total_point + %s, 
-                                date = %s, image_url = %s
-                            WHERE id = %s
-                        """, (status_absen, status_mood, status_dasi, total_point, total_point, current_time_wib, public_image_url, last_attendance[0]))
-                    else:
-                        # Insert baru jika hari berbeda
-                        semester_total_point = last_attendance[2] + total_point if last_attendance else total_point
-                        cursor.execute("""
-                            INSERT INTO attendance (student_id, status_absen, status_mood, status_dasi, point, semester_total_point, date, image_url) 
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                        """, (student_id, status_absen, status_mood, status_dasi, total_point, semester_total_point, current_time_wib, public_image_url))
-                        attendance_count += 1
-
-                    # Update pesan terakhir orang tua
-                    message = f"Siswa {student_name.title()} {status_absen} dan ({status_dasi}) pada {current_time_wib.strftime('%Y-%m-%d %H:%M:%S %z')}."
+                        UPDATE attendance
+                        SET status_absen = %s, status_mood = %s, status_dasi = %s, point = %s, 
+                            semester_total_point = semester_total_point + %s, 
+                            date = %s, image_url = %s
+                        WHERE id = %s
+                    """, (status_absen, status_mood, status_dasi, total_point, total_point, current_time_wib, public_image_url, last_attendance[0]))
+                else:
+                    # Insert baru jika hari berbeda
+                    semester_total_point = last_attendance[2] + total_point if last_attendance else total_point
                     cursor.execute("""
-                        UPDATE orang_tua 
-                        SET last_message = %s 
-                        WHERE student_id = %s
-                    """, (message, student_id))
-                    send_message.append(message)
+                        INSERT INTO attendance (student_id, status_absen, status_mood, status_dasi, point, semester_total_point, date, image_url) 
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (student_id, status_absen, status_mood, status_dasi, total_point, semester_total_point, current_time_wib, public_image_url))
+                    attendance_count += 1
 
-                    results["predict_absen"] = {
-                        "predicted_name": predicted_label_absen,
-                        "confidence": confidence_absen,
-                        "send_message": send_message,
-                        "datetime": current_time_wib.strftime('%Y-%m-%d %H:%M:%S %z'),
-                        "status_absen": status_absen,
-                        "attendance_count": attendance_count,
-                        "image_url": public_image_url
+                # Update pesan terakhir orang tua
+                message = f"Siswa {student_name.title()} {status_absen} dan ({status_dasi}) pada {current_time_wib.strftime('%Y-%m-%d %H:%M:%S %z')}."
+                cursor.execute("""
+                    UPDATE orang_tua 
+                    SET last_message = %s 
+                    WHERE student_id = %s
+                """, (message, student_id))
+                send_message.append(message)
+
+                results["predict_absen"] = {
+                    "predicted_name": predicted_label_absen,
+                    "confidence": confidence_absen,
+                    "send_message": send_message,
+                    "datetime": current_time_wib.strftime('%Y-%m-%d %H:%M:%S %z'),
+                    "status_absen": status_absen,
+                    "attendance_count": attendance_count,
+                    "image_url": public_image_url
+                }
+
+                results["predict_dasi"] = {
+                    "predicted_class": predicted_class_dasi,
+                    "confidence": confidence_dasi
+                }
+
+                results["predict_mood"] = {
+                    "predicted_class_name": predicted_class_mood,
+                    "confidence": float(confidence_mood),
+                    "class_probabilities": {
+                        class_names[i]: float(probabilities_mood[i])
+                        for i in range(len(class_names))
                     }
-
-                    results["predict_dasi"] = {
-                        "predicted_class": predicted_class_dasi,
-                        "confidence": confidence_dasi
-                    }
-
-                    results["predict_mood"] = {
-                        "predicted_class_name": predicted_class_mood,
-                        "confidence": float(confidence_mood),
-                        "class_probabilities": {
-                            class_names[i]: float(probabilities_mood[i])
-                            for i in range(len(class_names))
-                        }
-                    }
-
-        except Exception as e:
-            results["predict_absen"] = {"error": str(e)}
-            results["predict_dasi"] = {"error": str(e)}
-            results["predict_mood"] = {"error": str(e)}
+                }
 
         # Commit database setelah semua selesai
         connection.commit()
@@ -1075,7 +1165,6 @@ def predict_all():
     finally:
         if connection:
             connection.close()  # Tutup koneksi database
-        # Tidak perlu hapus file karena sudah dipindahkan ke storage
 
 def generate_unique_filename(original_filename):
     """
